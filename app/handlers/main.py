@@ -35,7 +35,7 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService)
         name = message.text.strip()
         await state.update_data(name=name)
         await message.answer(
-            "Какая у вас задача?",
+            "Расскажите, для чего вы планируете настроить VPN?",
             reply_markup=build_use_case_keyboard(),
         )
         await state.set_state(LeadForm.use_case)
