@@ -10,6 +10,7 @@ from app.config import load_config
 from app.handlers.main import register_handlers
 from app.handlers.notification import register_notification_handlers
 from app.notifications import NotificationService
+from app.payments import PaymentClient
 from app.storage import SQLiteStorage
 
 
@@ -26,12 +27,18 @@ async def main() -> None:
     )
     await notification_service.start()
 
+    payment_client = PaymentClient(
+        shop_id=config.yookassa_shop_id,
+        secret_key=config.yookassa_secret_key,
+        return_url=config.yookassa_return_url,
+    )
+
     bot = Bot(
         token=config.main_bot_token,
         default=DefaultBotProperties(parse_mode="HTML"),
     )
     dp = Dispatcher(storage=storage)
-    register_handlers(dp, notification_service)
+    register_handlers(dp, notification_service, payment_client)
 
     notify_dp = Dispatcher()
     register_notification_handlers(notify_dp, notification_service)

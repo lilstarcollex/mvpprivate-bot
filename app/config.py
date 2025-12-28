@@ -14,6 +14,9 @@ class Config:
     notification_chat_id: int
     storage_path: Path
     leads_db_path: Path
+    yookassa_shop_id: str | None
+    yookassa_secret_key: str | None
+    yookassa_return_url: str | None
 
 
 def load_config(env_path: str = ".env") -> Config:
@@ -25,6 +28,9 @@ def load_config(env_path: str = ".env") -> Config:
     notification_chat_id_raw = os.getenv("NOTIFICATION_CHAT_ID")
     storage_path = Path(os.getenv("STORAGE_PATH", "data/state.sqlite3"))
     leads_db_path = Path(os.getenv("LEADS_DB_PATH", "data/leads.sqlite3"))
+    yookassa_shop_id = os.getenv("YOOKASSA_SHOP_ID")
+    yookassa_secret_key = os.getenv("YOOKASSA_SECRET_KEY")
+    yookassa_return_url = os.getenv("YOOKASSA_RETURN_URL", "https://t.me/")
 
     if not main_bot_token:
         raise ValueError("MAIN_BOT_TOKEN is required")
@@ -47,6 +53,9 @@ def load_config(env_path: str = ".env") -> Config:
         notification_chat_id=notification_chat_id,
         storage_path=storage_path,
         leads_db_path=leads_db_path,
+        yookassa_shop_id=yookassa_shop_id,
+        yookassa_secret_key=yookassa_secret_key,
+        yookassa_return_url=yookassa_return_url,
     )
 
 

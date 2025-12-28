@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from aiogram import Dispatcher, F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -45,14 +47,28 @@ async def _send_page(message: Message, notification_service: NotificationService
     lines = []
     base_index = offset + 1
     for idx, lead in enumerate(leads, start=base_index):
+        protocols = lead.get("protocols")
+        if isinstance(protocols, str):
+            try:
+                protocols = json.loads(protocols)
+            except Exception:
+                pass
+        if protocols:
+            protocols_display = ", ".join(protocols)
+        else:
+            protocols_display = "—"
         lines.append(
             "\n".join(
                 [
-                    f"{idx}. {lead['created_at']}",
+                    f"{idx}. {lead.get('created_at', '')}",
+                    f"Сценарий: {lead.get('scenario') or '—'}",
                     f"Имя: {lead.get('name') or '—'}",
                     f"Тип задачи: {lead.get('use_case') or '—'}",
                     f"Детали: {lead.get('custom_task') or '—'}",
                     f"Дополнительно: {lead.get('extra') or '—'}",
+                    f"VPS IP: {lead.get('vps_ip') or '—'} | Домен: {lead.get('domain') or '—'}",
+                    f"Протоколы: {protocols_display}",
+                    f"Оплата: {lead.get('payment_status') or '—'}",
                     f"TG: @{lead['username']}" if lead.get("username") else f"TG ID: {lead.get('telegram_id')}",
                 ]
             )
