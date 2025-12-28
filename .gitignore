@@ -1,0 +1,21 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+
+# Environment variables
+.env
+
+# SQLite state/data
+data/*.sqlite3
+data/*.db
+data/*.sqlite
+
+# OS / tooling
+.DS_Store
+Thumbs.db
+
