@@ -13,6 +13,7 @@ class Config:
     notification_bot_token: str
     notification_chat_id: int
     storage_path: Path
+    leads_db_path: Path
 
 
 def load_config(env_path: str = ".env") -> Config:
@@ -23,6 +24,7 @@ def load_config(env_path: str = ".env") -> Config:
     notification_bot_token = os.getenv("NOTIFICATION_BOT_TOKEN")
     notification_chat_id_raw = os.getenv("NOTIFICATION_CHAT_ID")
     storage_path = Path(os.getenv("STORAGE_PATH", "data/state.sqlite3"))
+    leads_db_path = Path(os.getenv("LEADS_DB_PATH", "data/leads.sqlite3"))
 
     if not main_bot_token:
         raise ValueError("MAIN_BOT_TOKEN is required")
@@ -37,12 +39,14 @@ def load_config(env_path: str = ".env") -> Config:
         raise ValueError("NOTIFICATION_CHAT_ID must be an integer chat ID") from exc
 
     storage_path.parent.mkdir(parents=True, exist_ok=True)
+    leads_db_path.parent.mkdir(parents=True, exist_ok=True)
 
     return Config(
         main_bot_token=main_bot_token,
         notification_bot_token=notification_bot_token,
         notification_chat_id=notification_chat_id,
         storage_path=storage_path,
+        leads_db_path=leads_db_path,
     )
 
 

@@ -8,6 +8,7 @@ from aiogram.client.bot import DefaultBotProperties
 
 from app.config import load_config
 from app.handlers.main import register_handlers
+from app.handlers.notification import register_notification_handlers
 from app.notifications import NotificationService
 from app.storage import SQLiteStorage
 
@@ -21,6 +22,7 @@ async def main() -> None:
     notification_service = NotificationService(
         token=config.notification_bot_token,
         chat_id=config.notification_chat_id,
+        db_path=config.leads_db_path,
     )
     await notification_service.start()
 
@@ -31,8 +33,18 @@ async def main() -> None:
     dp = Dispatcher(storage=storage)
     register_handlers(dp, notification_service)
 
-    try:
+    notify_dp = Dispatcher()
+    register_notification_handlers(notify_dp, notification_service)
+
+    async def run_main_bot() -> None:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+    async def run_notification_bot() -> None:
+        notify_bot = notification_service.bot
+        await notify_dp.start_polling(notify_bot, allowed_updates=notify_dp.resolve_used_update_types())
+
+    try:
+        await asyncio.gather(run_main_bot(), run_notification_bot())
     finally:
         await notification_service.close()
         await storage.close()

@@ -6,6 +6,7 @@
 - `main.py` — точка входа.
 - `app/config.py` — загрузка конфигов из `.env`.
 - `app/handlers/main.py` — сценарий заявки (FSM).
+- `app/handlers/notification.py` — команды уведомительного бота (`/all`).
 - `app/keyboards/main.py` — inline + reply клавиатуры.
 - `app/notifications.py` — отправка данных во второй бот.
 - `app/storage/sqlite.py` — SQLite FSM storage (aiosqlite).
@@ -20,6 +21,7 @@
    - `NOTIFICATION_BOT_TOKEN` — токен бота-уведомителя.
    - `NOTIFICATION_CHAT_ID` — chat_id, куда слать уведомления (личка/группа/канал, при необходимости с `-100`).
    - `STORAGE_PATH` — путь к SQLite (по умолчанию `data/state.sqlite3`).
+   - `LEADS_DB_PATH` — путь к базе истории заявок (по умолчанию `data/leads.sqlite3`).
 3) Создать окружение и установить зависимости (Windows пример):
    ```powershell
    python -m venv .venv
@@ -43,6 +45,7 @@
 3. При «Свой вариант» просим описать задачу.  
 4. Просим доп. инфо с reply-кнопкой «Пропустить».  
 5. Отправляем итоговое сообщение пользователю и пересылаем структурированные данные в Notification BOT.
+6. В боте-уведомителе доступна команда `/all` — вывод последних заявок с пагинацией (кнопки «Назад/Вперёд»), история хранится в SQLite.
 
 ## Systemd для VPS (пример)
 `/etc/systemd/system/tg-lead-bot.service`:

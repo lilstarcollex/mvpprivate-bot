@@ -8,6 +8,7 @@ from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 
 from app.keyboards.main import build_skip_keyboard, build_use_case_keyboard
 from app.notifications import NotificationService
+from app.middlewares.submission_guard import SubmissionGuardMiddleware
 
 
 class LeadForm(StatesGroup):
@@ -19,6 +20,9 @@ class LeadForm(StatesGroup):
 
 def register_handlers(dp: Dispatcher, notification_service: NotificationService) -> None:
     router = Router(name="main")
+    guard_text = "Ваша заявка уже в обработке, с вами свяжутся в ближайшее время. Спасибо, что выбрали нас!"
+    router.message.middleware(SubmissionGuardMiddleware(notification_service, guard_text))
+    router.callback_query.middleware(SubmissionGuardMiddleware(notification_service, guard_text))
 
     @router.message(CommandStart())
     async def cmd_start(message: Message, state: FSMContext) -> None:
