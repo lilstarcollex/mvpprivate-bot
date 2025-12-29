@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, Set
 
@@ -12,13 +13,14 @@ from aiogram.types import CallbackQuery, Message
 from app.keyboards import (
     ALL_PROTOCOLS,
     build_bot_token_keyboard,
+    build_edit_fields_keyboard,
+    build_edit_prompt_keyboard,
     build_inline_skip,
     build_payment_keyboard,
     build_protocols_keyboard,
     build_scenario_keyboard,
     build_use_case_keyboard,
 )
-from app.middlewares.submission_guard import SubmissionGuardMiddleware
 from app.notifications import NotificationService
 from app.payments import PaymentClient
 from app.utils.net import extract_ipv4, resolve_domain
@@ -41,18 +43,24 @@ class LeadForm(StatesGroup):
     vps_bot_token = State()
 
 
+class EditLead(StatesGroup):
+    choose_field = State()
+    update_value = State()
+
+
 def register_handlers(dp: Dispatcher, notification_service: NotificationService, payment_client: PaymentClient) -> None:
     router = Router(name="main")
-    guard_text = "Ваш VPN уже в работе. Если появились вопросы или пожелания, напишите специалисту: @mvpvpnprivatespec. Спасибо, что выбрали нас!"
-    router.message.middleware(SubmissionGuardMiddleware(notification_service, guard_text))
-    router.callback_query.middleware(SubmissionGuardMiddleware(notification_service, guard_text))
 
     @router.message(CommandStart())
     async def cmd_start(message: Message, state: FSMContext) -> None:
+        if message.from_user and await notification_service.has_lead(message.from_user.id):
+            await _send_existing_notice(message)
+            await state.clear()
+            return
         await state.clear()
         await state.set_state(LeadForm.scenario)
         await message.answer(
-            "Привет! Выберите подходящий вариант:",
+            "Привет! Выберите сценарий:",
             reply_markup=build_scenario_keyboard(),
         )
 
@@ -64,11 +72,11 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
         if choice == "specialist":
             await state.update_data(scenario="Нужен специалист")
             await state.set_state(LeadForm.name)
-            await callback.message.answer("Как к вам обращаться?")
+            await callback.message.answer("Как вас зовут?")
         elif choice == "vps":
-            await state.update_data(scenario="Есть VPS и домен")
+            await state.update_data(scenario="Есть VPS, нужен настройщик")
             await state.set_state(LeadForm.vps_ip)
-            await callback.message.answer("Отправьте сообщением IP адрес сервера, в формате: 123.123.123.123")
+            await callback.message.answer("Укажите IP сервера (пример: 123.123.123.123)")
 
     # --- Specialist flow ---
     @router.message(LeadForm.name, F.text)
@@ -77,7 +85,7 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
         await state.update_data(name=name)
         await state.set_state(LeadForm.use_case)
         await message.answer(
-            "Какая у вас задача?",
+            "Выберите вариант использования:",
             reply_markup=build_use_case_keyboard(),
         )
 
@@ -87,7 +95,7 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
         _, choice = callback.data.split(":", 1)
         use_case_map = {
             "business": "Для бизнеса | Корпоративный",
-            "personal": "Личное использование",
+            "personal": "Личный | Дом",
             "custom": "Свой вариант",
         }
         use_case = use_case_map.get(choice, "Свой вариант")
@@ -95,7 +103,7 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
 
         if choice == "custom":
             await state.set_state(LeadForm.custom_task)
-            await callback.message.answer("Опишите вашу задачу.")
+            await callback.message.answer("Опишите задачу.")
         else:
             await _ask_additional_info(callback.message, state)
 
@@ -120,12 +128,12 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
     async def process_vps_ip(message: Message, state: FSMContext) -> None:
         ip = extract_ipv4(message.text)
         if not ip:
-            await message.answer("Не вижу корректный IPv4 адрес. Отправьте IP в формате 123.123.123.123")
+            await message.answer("IP некорректен. Пример: 123.123.123.123")
             return
         await state.update_data(vps_ip=ip)
         await state.set_state(LeadForm.vps_password)
         await message.answer(
-            "Отправьте пароль от root, он нужен будет специалисту для подключения и настройки сервера и VPN."
+            "Введите пароль root (используется только для проверки подключения по SSH).",
         )
 
     @router.message(LeadForm.vps_password, F.text)
@@ -136,39 +144,38 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
         ssh_ok = await test_ssh_connection(ip, password) if ip else False
         if not ssh_ok:
             await message.answer(
-                "Не удалось подключиться по SSH с этими данными. Проверьте IP/пароль и отправьте IP снова."
+                "Не удалось подключиться по SSH. Проверьте IP/пароль и попробуйте снова.",
             )
             await state.clear()
             await state.set_state(LeadForm.vps_ip)
             await state.update_data(scenario=data.get("scenario"))
-            await message.answer("Отправьте IP адрес сервера, в формате: 123.123.123.123")
+            await message.answer("Укажите IP сервера (пример: 123.123.123.123)")
             return
 
         await state.update_data(vps_password=password, ssh_ok=ssh_ok)
         await state.set_state(LeadForm.vps_domain)
-        await message.answer("Отправьте ваш домен.")
+        await message.answer("Укажите домен (если есть).")
 
     @router.message(LeadForm.vps_domain, F.text)
     async def process_vps_domain(message: Message, state: FSMContext) -> None:
         domain = message.text.strip()
         data = await state.get_data()
         ip = data.get("vps_ip")
-        resolved_ip = await resolve_domain(domain)
-        if not ip or not resolved_ip or resolved_ip != ip:
+        resolved_ip = await resolve_domain(domain) if domain else None
+        if domain and (not ip or not resolved_ip or resolved_ip != ip):
             await message.answer(
-                "Домен или IP указаны неверно, перепроверьте и отправьте данные снова.\n"
-                "Сначала IP, затем пароль root, затем домен."
+                "Домен не указывает на ваш IP. Проверьте данные и введите IP заново.",
             )
             await state.clear()
             await state.set_state(LeadForm.vps_ip)
             await state.update_data(scenario=data.get("scenario"))
-            await message.answer("Отправьте IP адрес сервера, в формате: 123.123.123.123")
+            await message.answer("Укажите IP сервера (пример: 123.123.123.123)")
             return
 
-        await state.update_data(domain=domain, resolved_ip=resolved_ip, selected_protocols=[])
+        await state.update_data(domain=domain if domain else None, resolved_ip=resolved_ip, selected_protocols=[])
         await state.set_state(LeadForm.vps_protocols)
         await message.answer(
-            "Данные прошли первичную проверку. Выберите протоколы:",
+            "Выберите протоколы (можно несколько):",
             reply_markup=build_protocols_keyboard(set()),
         )
 
@@ -181,14 +188,12 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
 
         if action == "finish":
             if not selected:
-                await callback.message.answer("Выберите хотя бы один протокол перед завершением.")
+                await callback.message.answer("Нужно выбрать хотя бы один протокол.")
                 return
             await state.update_data(selected_protocols=list(selected))
             await state.set_state(LeadForm.vps_bot_token)
             await callback.message.answer(
-                "Есть возможность управлять VPN через личный TG-бот. "
-                "Отправьте BOT TOKEN или нажмите «Пропустить».\n"
-                "Инструкция по созданию бота: https://core.telegram.org/bots#6-botfather",
+                "Пришлите BOT TOKEN вашего телеграм-бота (или нажмите пропустить).",
                 reply_markup=build_bot_token_keyboard(),
             )
             return
@@ -198,7 +203,7 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
             await state.update_data(selected_protocols=list(selected))
             remaining_keyboard = build_protocols_keyboard(selected)
             await callback.message.answer(
-                f"Вы выбрали протокол {action}. Вы можете выбрать ещё или закончить выбор.",
+                f"Добавлен {action}. Можно выбрать ещё или завершить.",
                 reply_markup=remaining_keyboard,
             )
 
@@ -213,13 +218,102 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
         token = message.text.strip()
         if not TOKEN_PATTERN.match(token):
             await message.answer(
-                "Это не похоже на BOT TOKEN. Отправьте корректный токен вида 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11 "
-                "или нажмите «Пропустить».",
+                "BOT TOKEN некорректен. Пример: 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
                 reply_markup=build_bot_token_keyboard(),
             )
             return
         await state.update_data(bot_token=token)
         await _handle_payment(message, state, notification_service, payment_client)
+
+    # --- Edit flow ---
+    @router.callback_query(F.data == "edit:start")
+    async def start_edit(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not await notification_service.has_lead(callback.from_user.id):
+            await callback.answer()
+            await callback.message.answer("Заявка не найдена. Начните заново: /start")
+            return
+        await callback.answer()
+        await state.set_state(EditLead.choose_field)
+        await callback.message.answer("Что вы хотите изменить?", reply_markup=build_edit_fields_keyboard())
+
+    @router.callback_query(EditLead.choose_field, F.data.startswith("edit:field:"))
+    async def choose_edit_field(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.from_user or not await notification_service.has_lead(callback.from_user.id):
+            await callback.answer()
+            await callback.message.answer("Заявка не найдена. Начните заново: /start")
+            return
+        await callback.answer()
+        field = callback.data.split(":")[-1]
+        await state.update_data(edit_field=field)
+        await state.set_state(EditLead.update_value)
+        prompts = {
+            "ip": "Отправьте IP, пароль и домен (каждый с новой строки). Домен можно пропустить.",
+            "name": "Отправьте новое имя.",
+            "token": "Отправьте новый BOT TOKEN.",
+            "protocols": f"Перечислите протоколы через запятую. Доступно: {', '.join(ALL_PROTOCOLS)}.",
+            "extra": "Отправьте новую дополнительную информацию.",
+        }
+        await callback.message.answer(prompts.get(field, "Отправьте новые данные."))
+
+    @router.callback_query(F.data == "edit:cancel")
+    async def cancel_edit(callback: CallbackQuery, state: FSMContext) -> None:
+        await callback.answer()
+        await state.clear()
+        await callback.message.answer("Изменение отменено.")
+
+    @router.message(EditLead.update_value, F.text)
+    async def apply_edit(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        field = data.get("edit_field")
+        if not field:
+            await state.clear()
+            await _send_existing_notice(message)
+            return
+
+        if field == "ip":
+            parts = [p.strip() for p in message.text.splitlines() if p.strip()]
+            if len(parts) < 2:
+                await message.answer("Укажите IP, пароль и домен (минимум IP и пароль) построчно.")
+                return
+            ip = extract_ipv4(parts[0])
+            if not ip:
+                await message.answer("IP указан некорректно. Пример: 123.123.123.123")
+                return
+            password = parts[1]
+            domain = parts[2] if len(parts) > 2 else None
+            ssh_ok = await test_ssh_connection(ip, password)
+            updates = {"vps_ip": ip, "root_password": password, "domain": domain, "ssh_ok": ssh_ok}
+        elif field == "name":
+            updates = {"name": message.text.strip()}
+        elif field == "token":
+            token = message.text.strip()
+            if not TOKEN_PATTERN.match(token):
+                await message.answer("BOT TOKEN некорректен, попробуйте ещё раз.")
+                return
+            updates = {"bot_token": token}
+        elif field == "protocols":
+            protocols = _parse_protocols_text(message.text)
+            if not protocols:
+                await message.answer(f"Укажите хотя бы один из: {', '.join(ALL_PROTOCOLS)}")
+                return
+            updates = {"protocols": protocols}
+        elif field == "extra":
+            updates = {"extra": message.text.strip()}
+        else:
+            updates = {}
+
+        await _apply_lead_updates(message, state, notification_service, updates)
+
+    @router.message()
+    async def existing_fallback(message: Message, state: FSMContext) -> None:
+        if not message.from_user:
+            return
+        current_state = await state.get_state()
+        if current_state and current_state.startswith(EditLead.__name__):
+            return
+        if await notification_service.has_lead(message.from_user.id):
+            await _send_existing_notice(message)
+            return
 
     dp.include_router(router)
 
@@ -227,16 +321,14 @@ def register_handlers(dp: Dispatcher, notification_service: NotificationService,
 async def _ask_additional_info(message: Message, state: FSMContext) -> None:
     await state.set_state(LeadForm.extra)
     await message.answer(
-        "Дополнительная информация для нас. Отправьте сообщение или нажмите «Пропустить».",
+        "Добавьте дополнительную информацию (или пропустите).",
         reply_markup=build_inline_skip("skip_extra"),
     )
 
 
 async def _finish_specialist_flow(message: Message, state: FSMContext, notification_service: NotificationService) -> None:
-    data = await state.update_data(
-        telegram_id=message.from_user.id if message.from_user else None,
-        username=message.from_user.username if message.from_user else None,
-    )
+    user_payload = await _collect_user_payload(message)
+    data = await state.update_data(**user_payload)
 
     payload = {
         "scenario": data.get("scenario") or "Нужен специалист",
@@ -244,14 +336,14 @@ async def _finish_specialist_flow(message: Message, state: FSMContext, notificat
         "use_case": data.get("use_case"),
         "custom_task": data.get("custom_task"),
         "extra": data.get("extra"),
-        "telegram_id": data.get("telegram_id"),
-        "username": data.get("username"),
         "status": "Принята",
         "payment_status": "pending",
+        **user_payload,
     }
 
     await message.answer(
-        "Ваша заявка принята и уже в обработке. В ближайшее время мы с вами свяжемся в личном чате. Спасибо, что выбрали нас!",
+        "Заявка принята! Специалист свяжется с вами. Если нужно что-то изменить, используйте кнопку ниже.",
+        reply_markup=build_edit_prompt_keyboard(),
     )
 
     await notification_service.send_lead(payload)
@@ -264,14 +356,12 @@ async def _handle_payment(
     notification_service: NotificationService,
     payment_client: PaymentClient,
 ) -> None:
-    await state.update_data(
-        telegram_id=message.from_user.id if message.from_user else None,
-        username=message.from_user.username if message.from_user else None,
-    )
+    user_payload = await _collect_user_payload(message)
+    await state.update_data(**user_payload)
     data = await state.get_data()
     payment_result = await payment_client.create_payment(
         amount_rub=999,
-        description="Оплата настройки VPN",
+        description="Настройка VPN",
         metadata={"telegram_id": data.get("telegram_id")},
     )
     await state.update_data(
@@ -281,8 +371,7 @@ async def _handle_payment(
     )
 
     await message.answer(
-        "Специалист начнёт работу, сразу после оплаты. Цена услуги 999 ₽.\n"
-        "Нажмите на кнопку, чтобы оплатить.",
+        "Счёт на оплату 999 ₽ сформирован.",
         reply_markup=build_payment_keyboard(payment_result.payment_url),
     )
 
@@ -290,15 +379,11 @@ async def _handle_payment(
 
 
 async def _finish_vps_flow(message: Message, state: FSMContext, notification_service: NotificationService) -> None:
-    data = await state.update_data(
-        telegram_id=message.from_user.id if message.from_user else None,
-        username=message.from_user.username if message.from_user else None,
-    )
+    user_payload = await _collect_user_payload(message)
+    data = await state.update_data(**user_payload)
 
     payload = {
-        "scenario": data.get("scenario") or "Есть VPS и домен",
-        "telegram_id": data.get("telegram_id"),
-        "username": data.get("username"),
+        "scenario": data.get("scenario") or "Есть VPS, нужен настройщик",
         "vps_ip": data.get("vps_ip"),
         "ssh_ok": data.get("ssh_ok"),
         "root_password": data.get("vps_password"),
@@ -309,13 +394,91 @@ async def _finish_vps_flow(message: Message, state: FSMContext, notification_ser
         "payment_url": data.get("payment_url"),
         "payment_status": data.get("payment_status"),
         "status": "Принята",
+        **user_payload,
     }
 
     await message.answer(
-        "Данные прошли проверку. Специалист уже занимается вашим сервером. "
-        "Ничего не делайте с сервером до окончания работ (не выключайте/не перезагружайте). "
-        "По завершению пришлём инструкцию по VPN и поможем сменить пароль.",
+        "Заявка принята! Специалист настроит VPN и уведомит вас. Если нужно поменять данные, нажмите «Изменить».",
+        reply_markup=build_edit_prompt_keyboard(),
     )
 
     await notification_service.send_lead(payload)
     await state.clear()
+
+
+async def _collect_user_payload(message: Message) -> Dict[str, Any]:
+    """
+    Собирает данные реального пользователя.
+    Если по какой-то причине message.from_user — бот, пробуем get_chat для актуальных данных.
+    """
+    user_obj = message.from_user
+    chat_obj = None
+    if (not user_obj) or user_obj.is_bot:
+        try:
+            chat_obj = await message.bot.get_chat(message.chat.id)
+            if chat_obj and getattr(chat_obj, "type", "") == "private":
+                user_obj = chat_obj
+        except Exception:
+            user_obj = message.from_user
+
+    if not user_obj:
+        return {}
+
+    try:
+        raw = user_obj.model_dump()
+    except Exception:
+        raw = None
+
+    return {
+        "telegram_id": user_obj.id,
+        "username": getattr(user_obj, "username", None),
+        "first_name": getattr(user_obj, "first_name", None),
+        "last_name": getattr(user_obj, "last_name", None),
+        "language_code": getattr(user_obj, "language_code", None),
+        "is_premium": getattr(user_obj, "is_premium", None),
+        "is_bot": getattr(user_obj, "is_bot", None),
+        "raw_user": raw,
+        "user_json": json.dumps(raw, ensure_ascii=False) if raw else None,
+    }
+
+
+def _parse_protocols_text(text: str) -> list[str]:
+    parts = [p.strip() for p in text.replace(";", ",").split(",") if p.strip()]
+    result: list[str] = []
+    for part in parts:
+        for proto in ALL_PROTOCOLS:
+            if part.lower() == proto.lower():
+                if proto not in result:
+                    result.append(proto)
+    return result
+
+
+async def _apply_lead_updates(message: Message, state: FSMContext, notification_service: NotificationService, updates: Dict[str, Any]) -> None:
+    user_payload = await _collect_user_payload(message)
+    telegram_id = user_payload.get("telegram_id")
+    if not telegram_id:
+        await message.answer("Не удалось определить пользователя.")
+        return
+
+    lead = await notification_service.update_lead_by_telegram(str(telegram_id), {**updates, **user_payload})
+    if not lead:
+        await message.answer("Заявка не найдена. Начните заново: /start")
+        await state.clear()
+        return
+
+    await notification_service.send_lead({**lead, **user_payload})
+    await message.answer(
+        "Данные обновлены. Если хотите изменить что-то ещё, выберите пункт ниже.",
+        reply_markup=build_edit_fields_keyboard(),
+    )
+    await state.set_state(EditLead.choose_field)
+
+
+async def _send_existing_notice(message: Message) -> None:
+    await message.answer(
+        'Ваша заявка уже создана. Специалист уже настраивает ваш VPN. Если вы хотите изменить данные, нажмите на кнопку "Изменить".',
+        reply_markup=build_edit_prompt_keyboard(),
+    )
+
+
+__all__ = ["register_handlers"]

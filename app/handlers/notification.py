@@ -19,15 +19,15 @@ PAGE_SIZE = 5
 STATUS_CODES = {
     "accepted": "Принята",
     "in_work": "В работе",
-    "waiting": "Ожидание правок",
-    "done": "Готово",
+    "waiting": "Ждет ответа",
+    "done": "Выполнена",
 }
 
 USER_STATUS_MESSAGES = {
-    "accepted": "Ваш сервер прошёл проверку, теперь мы подбираем специалиста. Как только специалист начнёт работу, мы вас оповестим. Спасибо, что выбрали нас!",
-    "in_work": "Специалист уже работает с вашим сервером, когда он будет готов, мы вас оповестим.",
-    "waiting": "Ответьте специалисту в личном чате. Возможно нужно что-то уточнить или что-то пошло не так.",
-    "done": "Ваш ВПН уже готов и ждёт вас. Наш специалист уже написал вам.",
+    "accepted": "Ваша заявка принята. Специалист уже работает над настройкой VPN. Если нужно что-то изменить, дайте знать.",
+    "in_work": "Специалист приступил к вашей заявке и работает над настройкой VPN.",
+    "waiting": "Требуются уточнения по вашей заявке. Ответьте на сообщение специалиста, чтобы продолжить.",
+    "done": "Настройка VPN завершена. Если потребуется помощь или изменения, просто напишите в чат.",
 }
 
 
@@ -38,7 +38,7 @@ class AdminStates(StatesGroup):
 def register_notification_handlers(dp: Dispatcher, notification_service: NotificationService) -> None:
     router = Router(name="notification")
 
-    # Публичный список
+    # Публичный список заявок
     @router.message(Command("all"))
     async def cmd_all(message: Message) -> None:
         await _send_page(message, notification_service, page=0, edit=False)
@@ -77,28 +77,51 @@ def register_notification_handlers(dp: Dispatcher, notification_service: Notific
             return
         await callback.answer()
         await state.set_state(AdminStates.search_query)
-        await callback.message.answer("Введите ID пользователя или @username для поиска.")
+        await callback.message.answer("Введите TG ID, @username или ID заявки для поиска.")
 
     @router.message(AdminStates.search_query, F.text)
     async def admin_search_query(message: Message, state: FSMContext) -> None:
         if not _is_admin_chat(message, notification_service):
             return
         query = message.text.strip()
-        results = await notification_service.search_leads(query, limit=10)
-        if not results:
+        lead_results = await notification_service.search_leads(query, limit=10)
+        user_results = await notification_service.search_users(query, limit=10)
+
+        if not lead_results and not user_results:
             await message.answer("Ничего не найдено.")
+            await state.clear()
             return
-        lines = []
-        buttons = []
-        for lead in results:
-            tg = lead.get("telegram_id") or "-"
-            uname = f"@{lead['username']}" if lead.get("username") else "-"
-            lines.append(f"#{lead['id']} | {uname} | {tg} | {lead.get('status') or '—'}")
-            buttons.append([InlineKeyboardButton(text=f"Открыть #{lead['id']}", callback_data=f"admin:view:{lead['id']}")])
+
+        lines: list[str] = []
+        buttons: list[list[InlineKeyboardButton]] = []
+
+        if lead_results:
+            lines.append("Заявки:")
+            for lead in lead_results:
+                tg = lead.get("telegram_id") or "-"
+                uname = f"@{lead['username']}" if lead.get("username") else "-"
+                lines.append(f"#{lead['id']} | {uname} | {tg} | {lead.get('status') or '—'}")
+                buttons.append([InlineKeyboardButton(text=f"Открыть заявку #{lead['id']}", callback_data=f"admin:view:{lead['id']}")])
+
+        if user_results:
+            lines.append("\nПользователи:")
+            for user in user_results:
+                tg = user.get("telegram_id") or "-"
+                uname = f"@{user['username']}" if user.get("username") else "-"
+                lines.append(f"U{user['id']} | {uname} | {tg}")
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"Открыть пользователя U{user['id']}",
+                            callback_data=f"admin:user:view:{user['id']}",
+                        )
+                    ]
+                )
+
         kb = InlineKeyboardMarkup(
             inline_keyboard=buttons + [[InlineKeyboardButton(text="Назад", callback_data="admin:menu")]]
         )
-        await message.answer("Результаты:\n" + "\n".join(lines), reply_markup=kb)
+        await message.answer("\n".join(lines), reply_markup=kb)
         await state.clear()
 
     @router.callback_query(F.data.startswith("admin:view:"))
@@ -131,11 +154,11 @@ def register_notification_handlers(dp: Dispatcher, notification_service: Notific
             return
         updated = await notification_service.update_status(lead_id, STATUS_CODES[status_code])
         if not updated:
-            await callback.message.answer("Не удалось обновить статус (заявка не найдена).")
+            await callback.message.answer("Не удалось обновить статус (вероятно, заявки уже нет).")
             return
         text = _format_lead_detail(updated)
         kb = _lead_actions_keyboard(lead_id, updated.get("status"))
-        await callback.message.answer(f"Статус обновлён на «{STATUS_CODES[status_code]}».")
+        await callback.message.answer(f"Статус изменён на «{STATUS_CODES[status_code]}».")
         await callback.message.answer(text, reply_markup=kb)
         user_id = updated.get("telegram_id")
         if user_id:
@@ -143,7 +166,7 @@ def register_notification_handlers(dp: Dispatcher, notification_service: Notific
             if note:
                 sent = await notification_service.send_user_notification(int(user_id), note)
                 if not sent:
-                    await callback.message.answer("Не удалось отправить уведомление пользователю (возможно, он не писал боту).")
+                    await callback.message.answer("Не удалось отправить уведомление пользователю.")
 
     @router.callback_query(F.data.startswith("admin:delete:"))
     async def admin_delete(callback: CallbackQuery) -> None:
@@ -161,7 +184,7 @@ def register_notification_handlers(dp: Dispatcher, notification_service: Notific
         if lead.get("telegram_id"):
             await notification_service.send_user_notification(
                 int(lead["telegram_id"]),
-                "Ваша заявка была удалена администратором. Если нужна новая, заполните форму заново.",
+                "Ваша заявка была удалена администратором. Если нужна новая настройка, начните заново.",
             )
 
     @router.callback_query(F.data == "admin:all")
@@ -183,6 +206,58 @@ def register_notification_handlers(dp: Dispatcher, notification_service: Notific
             return
         await _send_admin_page(callback.message, notification_service, page=page)
 
+    @router.callback_query(F.data == "admin:users")
+    async def admin_users(callback: CallbackQuery) -> None:
+        if not _is_admin_chat(callback.message, notification_service):
+            return
+        await callback.answer()
+        await _send_user_page(callback.message, notification_service, page=0)
+
+    @router.callback_query(F.data.startswith("admin:users:"))
+    async def admin_users_paginate(callback: CallbackQuery) -> None:
+        if not _is_admin_chat(callback.message, notification_service):
+            return
+        await callback.answer()
+        raw = callback.data.split(":")[-1]
+        try:
+            page = int(raw)
+        except ValueError:
+            return
+        await _send_user_page(callback.message, notification_service, page=page)
+
+    @router.callback_query(F.data.startswith("admin:user:view:"))
+    async def admin_user_view(callback: CallbackQuery) -> None:
+        if not _is_admin_chat(callback.message, notification_service):
+            return
+        await callback.answer()
+        user_id = _parse_int(callback.data.split(":")[-1])
+        if not user_id:
+            return
+        user = await notification_service.get_user(user_id)
+        if not user:
+            await callback.message.answer("Пользователь не найден.")
+            return
+        text = _format_user_detail(user)
+        kb = _user_actions_keyboard(user)
+        await callback.message.answer(text, reply_markup=kb)
+
+    @router.callback_query(F.data.startswith("admin:user:delete:"))
+    async def admin_user_delete(callback: CallbackQuery) -> None:
+        if not _is_admin_chat(callback.message, notification_service):
+            return
+        await callback.answer()
+        user_id = _parse_int(callback.data.split(":")[-1])
+        if not user_id:
+            return
+        user = await notification_service.delete_user(user_id)
+        if not user:
+            await callback.message.answer("Пользователь не найден.")
+            return
+        msg = f"Пользователь U{user_id} удалён."
+        if user.get("lead"):
+            msg += " Связанная заявка также удалена."
+        await callback.message.answer(msg)
+
     @router.callback_query(F.data == "admin:export")
     async def admin_export(callback: CallbackQuery) -> None:
         if not _is_admin_chat(callback.message, notification_service):
@@ -200,7 +275,7 @@ def _is_admin_chat(message: Optional[Message], notification_service: Notificatio
 async def _send_page(message: Message, notification_service: NotificationService, page: int, edit: bool) -> None:
     total = await notification_service.count_leads()
     if total == 0:
-        await message.answer("История заявок пуста.")
+        await message.answer("Заявок пока нет.")
         return
 
     total_pages = (total - 1) // PAGE_SIZE + 1
@@ -218,19 +293,18 @@ async def _send_page(message: Message, notification_service: NotificationService
                     f"{idx}. {lead.get('created_at', '')}",
                     f"Сценарий: {lead.get('scenario') or '—'}",
                     f"Имя: {lead.get('name') or '—'}",
-                    f"Тип задачи: {lead.get('use_case') or '—'}",
-                    f"Детали: {lead.get('custom_task') or '—'}",
-                    f"Дополнительно: {lead.get('extra') or '—'}",
+                    f"Use-case: {lead.get('use_case') or '—'}",
+                    f"Extra: {lead.get('extra') or '—'}",
                     f"VPS IP: {lead.get('vps_ip') or '—'} | Домен: {lead.get('domain') or '—'}",
                     f"Протоколы: {protocols_display}",
-                    f"Оплата: {lead.get('payment_status') or '—'}",
+                    f"Статус оплаты: {lead.get('payment_status') or '—'}",
                     f"Статус: {lead.get('status') or '—'}",
                     f"TG: @{lead['username']}" if lead.get("username") else f"TG ID: {lead.get('telegram_id')}",
                 ]
             )
         )
 
-    text = f"Заявки (страница {page + 1}/{total_pages}):\n\n" + "\n\n".join(lines)
+    text = f"Заявки ({page + 1}/{total_pages}):\n\n" + "\n\n".join(lines)
     if len(text) > 3800:
         text = text[:3800] + "\n…"
 
@@ -248,13 +322,13 @@ def _build_pagination_keyboard(page: int, total_pages: int) -> InlineKeyboardMar
 
     rows = [
         [
-            InlineKeyboardButton(text="⏮️ В начало", callback_data="leads:0"),
+            InlineKeyboardButton(text="⏮️", callback_data="leads:0"),
             InlineKeyboardButton(text=f"{page + 1} / {total_pages}", callback_data=f"leads:{page}"),
-            InlineKeyboardButton(text="⏭️ В конец", callback_data=f"leads:{total_pages - 1}"),
+            InlineKeyboardButton(text="⏭️", callback_data=f"leads:{total_pages - 1}"),
         ],
         [
-            InlineKeyboardButton(text="« Назад", callback_data=f"leads:{prev_page}"),
-            InlineKeyboardButton(text="Вперёд »", callback_data=f"leads:{next_page}"),
+            InlineKeyboardButton(text="◀️", callback_data=f"leads:{prev_page}"),
+            InlineKeyboardButton(text="▶️", callback_data=f"leads:{next_page}"),
         ],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -263,9 +337,10 @@ def _build_pagination_keyboard(page: int, total_pages: int) -> InlineKeyboardMar
 def _admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Поиск пользователя", callback_data="admin:search")],
-            [InlineKeyboardButton(text="Все заявки", callback_data="admin:all")],
-            [InlineKeyboardButton(text="Сформировать таблицу", callback_data="admin:export")],
+            [InlineKeyboardButton(text="Поиск", callback_data="admin:search")],
+            [InlineKeyboardButton(text="Заявки", callback_data="admin:all")],
+            [InlineKeyboardButton(text="Пользователи", callback_data="admin:users")],
+            [InlineKeyboardButton(text="Экспорт Excel", callback_data="admin:export")],
         ]
     )
 
@@ -284,24 +359,63 @@ async def _send_admin_page(message: Message, notification_service: NotificationS
     buttons: List[List[InlineKeyboardButton]] = []
     for lead in leads:
         protocols_display = _format_protocols(lead.get("protocols"))
+        uname = f"@{lead['username']}" if lead.get("username") else (lead.get("telegram_id") or "—")
         lines.append(
-            f"#{lead['id']} | {lead.get('name') or '—'} | {lead.get('status') or '—'} | {lead.get('scenario') or '—'} | {protocols_display}"
+            f"#{lead['id']} | {lead.get('name') or '—'} | {lead.get('status') or '—'} | {lead.get('scenario') or '—'} | {protocols_display} | {uname}"
         )
-        buttons.append([InlineKeyboardButton(text=f"Открыть #{lead['id']}", callback_data=f"admin:view:{lead['id']}")])
+        buttons.append(
+            [InlineKeyboardButton(text=f"Открыть #{lead['id']}", callback_data=f"admin:view:{lead['id']}")]
+        )
 
     pag_buttons = [
         [
             InlineKeyboardButton(text="⏮️", callback_data=f"admin:list:0"),
-            InlineKeyboardButton(text="«", callback_data=f"admin:list:{max(page-1,0)}"),
+            InlineKeyboardButton(text="◀️", callback_data=f"admin:list:{max(page-1,0)}"),
             InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="admin:menu"),
-            InlineKeyboardButton(text="»", callback_data=f"admin:list:{min(page+1,total_pages-1)}"),
+            InlineKeyboardButton(text="▶️", callback_data=f"admin:list:{min(page+1,total_pages-1)}"),
             InlineKeyboardButton(text="⏭️", callback_data=f"admin:list:{total_pages-1}"),
         ]
     ]
     kb = InlineKeyboardMarkup(
         inline_keyboard=buttons + pag_buttons + [[InlineKeyboardButton(text="Назад", callback_data="admin:menu")]]
     )
-    await message.answer("Все заявки:\n" + "\n".join(lines), reply_markup=kb)
+    await message.answer("Заявки:\n" + "\n".join(lines), reply_markup=kb)
+
+
+async def _send_user_page(message: Message, notification_service: NotificationService, page: int) -> None:
+    total = await notification_service.count_users()
+    if total == 0:
+        await message.answer("Пользователей нет.")
+        return
+    total_pages = (total - 1) // PAGE_SIZE + 1
+    page = max(0, min(page, total_pages - 1))
+    offset = page * PAGE_SIZE
+    users = await notification_service.fetch_users(limit=PAGE_SIZE, offset=offset)
+
+    lines = []
+    buttons: List[List[InlineKeyboardButton]] = []
+    for user in users:
+        uname = f"@{user['username']}" if user.get("username") else "—"
+        lines.append(
+            f"U{user['id']} | {uname} | {user.get('telegram_id') or '—'} | lead #{user.get('lead_id') or '—'}"
+        )
+        buttons.append(
+            [InlineKeyboardButton(text=f"Открыть U{user['id']}", callback_data=f"admin:user:view:{user['id']}")]
+        )
+
+    pag_buttons = [
+        [
+            InlineKeyboardButton(text="⏮️", callback_data=f"admin:users:0"),
+            InlineKeyboardButton(text="◀️", callback_data=f"admin:users:{max(page-1,0)}"),
+            InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="admin:menu"),
+            InlineKeyboardButton(text="▶️", callback_data=f"admin:users:{min(page+1,total_pages-1)}"),
+            InlineKeyboardButton(text="⏭️", callback_data=f"admin:users:{total_pages-1}"),
+        ]
+    ]
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=buttons + pag_buttons + [[InlineKeyboardButton(text="Назад", callback_data="admin:menu")]]
+    )
+    await message.answer("Пользователи:\n" + "\n".join(lines), reply_markup=kb)
 
 
 def _format_protocols(value: Any) -> str:
@@ -318,23 +432,57 @@ def _format_protocols(value: Any) -> str:
 
 def _format_lead_detail(lead: dict[str, Any]) -> str:
     protocols_display = _format_protocols(lead.get("protocols"))
+    ssh_val = lead.get("ssh_ok")
+    if ssh_val is None:
+        ssh_display = "—"
+    else:
+        ssh_display = "Да" if ssh_val else "Нет"
+    premium_display = "Да" if lead.get("is_premium") else "Нет" if lead.get("is_premium") is not None else "—"
+    bot_display = "Да" if lead.get("is_bot") else "Нет" if lead.get("is_bot") is not None else "—"
     return "\n".join(
         [
             f"#{lead.get('id')} | {lead.get('created_at')}",
             f"Статус: {lead.get('status') or '—'}",
             f"Сценарий: {lead.get('scenario') or '—'}",
             f"Имя: {lead.get('name') or '—'}",
-            f"Тип задачи: {lead.get('use_case') or '—'}",
-            f"Детали: {lead.get('custom_task') or '—'}",
-            f"Дополнительно: {lead.get('extra') or '—'}",
+            f"Use-case: {lead.get('use_case') or '—'}",
+            f"Своя задача: {lead.get('custom_task') or '—'}",
+            f"Доп. информация: {lead.get('extra') or '—'}",
             f"TG: @{lead['username']}" if lead.get("username") else f"TG ID: {lead.get('telegram_id')}",
+            f"Имя TG: {lead.get('first_name') or '—'}",
+            f"Фамилия TG: {lead.get('last_name') or '—'}",
+            f"Язык: {lead.get('language_code') or '—'}",
+            f"Premium: {premium_display}",
+            f"Bot: {bot_display}",
             f"VPS IP: {lead.get('vps_ip') or '—'}",
             f"Домен: {lead.get('domain') or '—'}",
-            f"SSH: {lead.get('ssh_ok')}",
+            f"SSH: {ssh_display}",
             f"Протоколы: {protocols_display}",
+            f"Root пароль: {lead.get('root_password') or '—'}",
             f"Bot Token: {lead.get('bot_token') or '—'}",
-            f"Оплата: {lead.get('payment_status') or '—'}",
+            f"Статус оплаты: {lead.get('payment_status') or '—'}",
             f"Payment URL: {lead.get('payment_url') or '—'}",
+        ]
+    )
+
+
+def _format_user_detail(user: dict[str, Any]) -> str:
+    lead_id = user.get("lead_id")
+    lead_status = user.get("lead_status") or "—"
+    premium_display = "Да" if user.get("is_premium") else "Нет" if user.get("is_premium") is not None else "—"
+    bot_display = "Да" if user.get("is_bot") else "Нет" if user.get("is_bot") is not None else "—"
+    return "\n".join(
+        [
+            f"U{user.get('id')} | {user.get('created_at')}",
+            f"TG ID: {user.get('telegram_id')}",
+            f"Username: @{user['username']}" if user.get("username") else "Username: —",
+            f"Имя: {user.get('first_name') or '—'}",
+            f"Фамилия: {user.get('last_name') or '—'}",
+            f"Язык: {user.get('language_code') or '—'}",
+            f"Premium: {premium_display}",
+            f"Bot: {bot_display}",
+            f"Связанная заявка: #{lead_id}" if lead_id else "Связанная заявка: —",
+            f"Статус заявки: {lead_status}",
         ]
     )
 
@@ -351,15 +499,25 @@ def _lead_actions_keyboard(lead_id: int, current_status: Optional[str]) -> Inlin
     if status_buttons:
         rows.append(status_buttons)
 
-    rows.append([InlineKeyboardButton(text="Удалить", callback_data=f"admin:delete:{lead_id}")])
-    rows.append([InlineKeyboardButton(text="Назад в меню", callback_data="admin:menu")])
+    rows.append([InlineKeyboardButton(text="Удалить заявку", callback_data=f"admin:delete:{lead_id}")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="admin:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _user_actions_keyboard(user: dict[str, Any]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    lead_id = user.get("lead_id")
+    if lead_id:
+        rows.append([InlineKeyboardButton(text=f"Открыть заявку #{lead_id}", callback_data=f"admin:view:{lead_id}")])
+    rows.append([InlineKeyboardButton(text="Удалить пользователя", callback_data=f"admin:user:delete:{user['id']}")])
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="admin:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _export_excel(message: Message, notification_service: NotificationService) -> None:
     leads = await notification_service.fetch_all_leads()
     if not leads:
-        await message.answer("Заявок нет для экспорта.")
+        await message.answer("Заявок нет.")
         return
 
     wb = Workbook()
@@ -376,10 +534,17 @@ async def _export_excel(message: Message, notification_service: NotificationServ
         "Extra",
         "Telegram ID",
         "Username",
+        "First Name",
+        "Last Name",
+        "Language Code",
+        "Is Premium",
+        "Is Bot",
+        "User JSON",
         "VPS IP",
         "SSH OK",
         "Domain",
         "Protocols",
+        "Root Password",
         "Bot Token",
         "Payment ID",
         "Payment URL",
@@ -400,10 +565,17 @@ async def _export_excel(message: Message, notification_service: NotificationServ
                 lead.get("extra"),
                 lead.get("telegram_id"),
                 lead.get("username"),
+                lead.get("first_name"),
+                lead.get("last_name"),
+                lead.get("language_code"),
+                lead.get("is_premium"),
+                lead.get("is_bot"),
+                lead.get("user_json"),
                 lead.get("vps_ip"),
                 lead.get("ssh_ok"),
                 lead.get("domain"),
                 _format_protocols(lead.get("protocols")),
+                lead.get("root_password"),
                 lead.get("bot_token"),
                 lead.get("payment_id"),
                 lead.get("payment_url"),

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Sequence, Set
+from typing import List, Sequence, Set
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 def build_scenario_keyboard() -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="У меня уже есть VPS и домен", callback_data="scenario:vps")],
+        [InlineKeyboardButton(text="Есть VPS, нужен настройщик", callback_data="scenario:vps")],
         [InlineKeyboardButton(text="Нужен специалист", callback_data="scenario:specialist")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -17,7 +17,7 @@ def build_use_case_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton(text="Для бизнеса | Корпоративный", callback_data="use_case:business"),
-            InlineKeyboardButton(text="Личное использование", callback_data="use_case:personal"),
+            InlineKeyboardButton(text="Личный | Дом", callback_data="use_case:personal"),
         ],
         [InlineKeyboardButton(text="Свой вариант", callback_data="use_case:custom")],
     ]
@@ -44,7 +44,7 @@ def build_protocols_keyboard(selected: Set[str]) -> InlineKeyboardMarkup:
             row = []
     if row:
         buttons.append(row)
-    buttons.append([InlineKeyboardButton(text="Закончить выбор", callback_data="proto:finish")])
+    buttons.append([InlineKeyboardButton(text="Готово", callback_data="proto:finish")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -64,6 +64,27 @@ def build_bot_token_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def build_edit_prompt_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Изменить", callback_data="edit:start")],
+        ]
+    )
+
+
+def build_edit_fields_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="IP, пароль и домен", callback_data="edit:field:ip")],
+            [InlineKeyboardButton(text="Имя", callback_data="edit:field:name")],
+            [InlineKeyboardButton(text="Токен бота", callback_data="edit:field:token")],
+            [InlineKeyboardButton(text="Протоколы", callback_data="edit:field:protocols")],
+            [InlineKeyboardButton(text="Дополнительную информацию", callback_data="edit:field:extra")],
+            [InlineKeyboardButton(text="Отмена", callback_data="edit:cancel")],
+        ]
+    )
+
+
 __all__ = [
     "build_scenario_keyboard",
     "build_use_case_keyboard",
@@ -71,5 +92,7 @@ __all__ = [
     "build_protocols_keyboard",
     "build_payment_keyboard",
     "build_bot_token_keyboard",
+    "build_edit_prompt_keyboard",
+    "build_edit_fields_keyboard",
     "ALL_PROTOCOLS",
 ]

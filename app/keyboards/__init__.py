@@ -1,6 +1,8 @@
 from .main import (
     ALL_PROTOCOLS,
     build_bot_token_keyboard,
+    build_edit_fields_keyboard,
+    build_edit_prompt_keyboard,
     build_inline_skip,
     build_payment_keyboard,
     build_protocols_keyboard,
@@ -15,5 +17,7 @@ __all__ = [
     "build_protocols_keyboard",
     "build_payment_keyboard",
     "build_bot_token_keyboard",
+    "build_edit_prompt_keyboard",
+    "build_edit_fields_keyboard",
     "ALL_PROTOCOLS",
 ]

@@ -27,6 +27,7 @@ class NotificationService:
         self._db: Optional[aiosqlite.Connection] = None
         self._main_bot: Optional[Bot] = None
         self._main_session: Optional[AiohttpSession] = None
+        self._lead_cache: set[str] = set()
 
     async def start(self) -> None:
         if self._bot:
@@ -35,6 +36,7 @@ class NotificationService:
         self._db = await aiosqlite.connect(self.db_path)
         self._db.row_factory = aiosqlite.Row
         await self._ensure_table()
+        await self._warm_cache()
         self._session = AiohttpSession()
         self._bot = Bot(
             token=self.token,
@@ -70,6 +72,7 @@ class NotificationService:
         if not self._bot:
             raise RuntimeError("NotificationService is not started")
 
+        await self._save_user_from_payload(payload)
         text = self._format_payload(payload)
         await self._save_lead(payload)
         try:
@@ -90,7 +93,8 @@ class NotificationService:
         cursor = await self._db.execute(
             """
             SELECT id, created_at, scenario, name, use_case, custom_task, extra,
-                   telegram_id, username, vps_ip, ssh_ok, domain, protocols, bot_token,
+                   telegram_id, username, first_name, last_name, language_code, is_premium, is_bot, user_json,
+                   vps_ip, ssh_ok, root_password, domain, protocols, bot_token,
                    payment_id, payment_url, payment_status, status
             FROM leads
             ORDER BY id DESC
@@ -108,7 +112,8 @@ class NotificationService:
         cursor = await self._db.execute(
             """
             SELECT id, created_at, scenario, name, use_case, custom_task, extra,
-                   telegram_id, username, vps_ip, ssh_ok, domain, protocols, bot_token,
+                   telegram_id, username, first_name, last_name, language_code, is_premium, is_bot, user_json,
+                   vps_ip, ssh_ok, root_password, domain, protocols, bot_token,
                    payment_id, payment_url, payment_status, status
             FROM leads
             ORDER BY id DESC
@@ -126,16 +131,124 @@ class NotificationService:
         await cursor.close()
         return int(row["cnt"] if row and "cnt" in row.keys() else 0)
 
-    async def has_lead(self, telegram_id: int) -> bool:
+    async def count_users(self) -> int:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        cursor = await self._db.execute("SELECT COUNT(*) as cnt FROM users")
+        row = await cursor.fetchone()
+        await cursor.close()
+        return int(row["cnt"] if row and "cnt" in row.keys() else 0)
+
+    async def fetch_users(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         if not self._db:
             raise RuntimeError("NotificationService DB is not initialized")
         cursor = await self._db.execute(
-            "SELECT 1 FROM leads WHERE telegram_id = ? LIMIT 1",
-            (str(telegram_id),),
+            """
+            SELECT u.*, l.id as lead_id, l.status as lead_status
+            FROM users u
+            LEFT JOIN leads l ON l.telegram_id = u.telegram_id
+            ORDER BY u.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [dict(r) for r in rows]
+
+    async def get_user(self, user_id: int) -> Optional[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        cursor = await self._db.execute(
+            """
+            SELECT u.*, l.id as lead_id, l.status as lead_status
+            FROM users u
+            LEFT JOIN leads l ON l.telegram_id = u.telegram_id
+            WHERE u.id = ?
+            LIMIT 1
+            """,
+            (user_id,),
         )
         row = await cursor.fetchone()
         await cursor.close()
-        return bool(row)
+        return dict(row) if row else None
+
+    async def get_user_by_telegram(self, telegram_id: str) -> Optional[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        cursor = await self._db.execute(
+            """
+            SELECT u.*, l.id as lead_id, l.status as lead_status
+            FROM users u
+            LEFT JOIN leads l ON l.telegram_id = u.telegram_id
+            WHERE u.telegram_id = ?
+            LIMIT 1
+            """,
+            (telegram_id,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        return dict(row) if row else None
+
+    async def delete_user(self, user_id: int) -> Optional[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        user = await self.get_user(user_id)
+        if not user:
+            return None
+        tgid = user.get("telegram_id")
+        lead = None
+        if tgid:
+            lead = await self.get_lead_by_telegram(str(tgid))
+            await self._db.execute("DELETE FROM leads WHERE telegram_id=?", (str(tgid),))
+            self._lead_cache.discard(str(tgid))
+        await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
+        await self._db.commit()
+        if lead:
+            user["lead"] = lead
+        return user
+
+    async def search_users(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        query = query.strip().lstrip("@")
+        params: list[Any] = []
+        sql = """
+        SELECT u.*, l.id as lead_id, l.status as lead_status
+        FROM users u
+        LEFT JOIN leads l ON l.telegram_id = u.telegram_id
+        WHERE 1=1
+        """
+        if query.isdigit():
+            sql += " AND (u.telegram_id = ? OR u.id = ?)"
+            params.extend([query, int(query)])
+        else:
+            sql += " AND (LOWER(u.username) LIKE ? OR LOWER(u.first_name) LIKE ? OR LOWER(u.last_name) LIKE ?)"
+            like = f"%{query.lower()}%"
+            params.extend([like, like, like])
+        sql += " ORDER BY u.id DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self._db.execute(sql, params)
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [dict(r) for r in rows]
+
+    async def has_lead(self, telegram_id: int) -> bool:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        tgid = str(telegram_id)
+        if tgid in self._lead_cache:
+            return True
+        cursor = await self._db.execute(
+            "SELECT 1 FROM leads WHERE telegram_id = ? LIMIT 1",
+            (tgid,),
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row:
+            self._lead_cache.add(tgid)
+            return True
+        return False
 
     async def get_lead(self, lead_id: int) -> Optional[dict[str, Any]]:
         if not self._db:
@@ -145,6 +258,29 @@ class NotificationService:
         await cursor.close()
         return dict(row) if row else None
 
+    async def get_lead_by_telegram(self, telegram_id: str) -> Optional[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        cursor = await self._db.execute("SELECT * FROM leads WHERE telegram_id=? LIMIT 1", (telegram_id,))
+        row = await cursor.fetchone()
+        await cursor.close()
+        return dict(row) if row else None
+
+    async def update_lead_by_telegram(self, telegram_id: str, updates: Dict[str, Any]) -> Optional[dict[str, Any]]:
+        existing = await self.get_lead_by_telegram(telegram_id)
+        if not existing:
+            return None
+        merged = {**existing, **updates, "telegram_id": telegram_id}
+        protocols = merged.get("protocols")
+        if isinstance(protocols, str):
+            try:
+                merged["protocols"] = json.loads(protocols)
+            except Exception:
+                merged["protocols"] = [protocols]
+        await self._save_user_from_payload(merged)
+        await self._save_lead(merged)
+        return await self.get_lead_by_telegram(telegram_id)
+
     async def delete_lead(self, lead_id: int) -> Optional[dict[str, Any]]:
         if not self._db:
             raise RuntimeError("NotificationService DB is not initialized")
@@ -153,6 +289,8 @@ class NotificationService:
             return None
         await self._db.execute("DELETE FROM leads WHERE id=?", (lead_id,))
         await self._db.commit()
+        if lead.get("telegram_id"):
+            self._lead_cache.discard(str(lead["telegram_id"]))
         return lead
 
     async def search_leads(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
@@ -209,11 +347,17 @@ class NotificationService:
         user_id = payload.get("telegram_id") or "—"
         username = payload.get("username")
         username_display = f"@{html.escape(username)}" if username else "—"
+        first_name = html.escape(payload.get("first_name") or "—")
+        last_name = html.escape(payload.get("last_name") or "—")
+        language_code = html.escape(payload.get("language_code") or "—")
+        premium_display = "Да" if payload.get("is_premium") else "Нет" if payload.get("is_premium") is not None else "—"
+        bot_flag_display = "Да" if payload.get("is_bot") else "Нет" if payload.get("is_bot") is not None else "—"
         vps_ip = html.escape(payload.get("vps_ip") or "—")
         domain = html.escape(payload.get("domain") or "—")
         ssh_ok = payload.get("ssh_ok")
-        ssh_status = "✅" if ssh_ok else ("⚠️" if ssh_ok is not None else "—")
-        protocols = payload.get("protocols") or []
+        ssh_status = "Да" if ssh_ok else ("Нет" if ssh_ok is not None else "—")
+        root_password = html.escape(payload.get("root_password") or "—")
+        protocols = payload.get("protocols")
         if isinstance(protocols, str):
             try:
                 protocols = json.loads(protocols)
@@ -224,25 +368,32 @@ class NotificationService:
         bot_token_masked = f"{bot_token[:6]}***" if bot_token else "—"
         payment_status = payload.get("payment_status") or "—"
         payment_url = html.escape(payload.get("payment_url") or "—")
+        status = html.escape(payload.get("status") or "—")
 
         lines = [
-            "<b>Новая заявка</b>",
+            "<b>Новая/обновленная заявка</b>",
             f"Сценарий: <b>{scenario}</b>",
             f"Имя: <b>{name}</b>",
-            f"Тип задачи: <b>{use_case}</b>",
-            f"Детали задачи: {custom_task}",
-            f"Дополнительная информация: {extra}",
+            f"Кейс: <b>{use_case}</b>",
+            f"Своя задача: {custom_task}",
+            f"Доп. информация: {extra}",
             f"Telegram ID: <code>{user_id}</code>",
             f"Username: {username_display}",
+            f"Имя в TG: <b>{first_name}</b>",
+            f"Фамилия в TG: <b>{last_name}</b>",
+            f"Язык: <b>{language_code}</b>",
+            f"Premium: {premium_display}",
+            f"User is bot: {bot_flag_display}",
             "",
             f"VPS IP: {vps_ip}",
-            f"Domain: {domain}",
+            f"Домен: {domain}",
             f"SSH доступ: {ssh_status}",
+            f"Root пароль: <code>{root_password}</code>",
             f"Протоколы: {protocols_display}",
             f"Bot Token: {bot_token_masked}",
-            f"Оплата: {payment_status}",
+            f"Платеж: {payment_status}",
             f"Payment URL: {payment_url}",
-            f"Статус: {html.escape(payload.get('status') or '—')}",
+            f"Статус: {status}",
         ]
         return "\n".join(lines)
 
@@ -260,6 +411,12 @@ class NotificationService:
                 extra TEXT,
                 telegram_id TEXT,
                 username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                language_code TEXT,
+                is_premium INTEGER,
+                is_bot INTEGER,
+                user_json TEXT,
                 vps_ip TEXT,
                 ssh_ok INTEGER,
                 root_password TEXT,
@@ -273,7 +430,6 @@ class NotificationService:
             );
             """
         )
-        # Add missing columns if DB already exists.
         for column, ddl in [
             ("scenario", "ALTER TABLE leads ADD COLUMN scenario TEXT"),
             ("vps_ip", "ALTER TABLE leads ADD COLUMN vps_ip TEXT"),
@@ -286,54 +442,116 @@ class NotificationService:
             ("payment_url", "ALTER TABLE leads ADD COLUMN payment_url TEXT"),
             ("payment_status", "ALTER TABLE leads ADD COLUMN payment_status TEXT"),
             ("status", "ALTER TABLE leads ADD COLUMN status TEXT"),
+            ("first_name", "ALTER TABLE leads ADD COLUMN first_name TEXT"),
+            ("last_name", "ALTER TABLE leads ADD COLUMN last_name TEXT"),
+            ("language_code", "ALTER TABLE leads ADD COLUMN language_code TEXT"),
+            ("is_premium", "ALTER TABLE leads ADD COLUMN is_premium INTEGER"),
+            ("is_bot", "ALTER TABLE leads ADD COLUMN is_bot INTEGER"),
+            ("user_json", "ALTER TABLE leads ADD COLUMN user_json TEXT"),
         ]:
-            if not await self._has_column(column):
+            if not await self._has_column(column, table="leads"):
                 await self._db.execute(ddl)
 
-        await self._db.execute(
-            """
-            DELETE FROM leads
-            WHERE telegram_id IS NOT NULL
-              AND id NOT IN (
-                SELECT MAX(id) FROM leads WHERE telegram_id IS NOT NULL GROUP BY telegram_id
-            );
-            """
-        )
+        # Ensure unique index without partial condition for UPSERT compatibility.
+        await self._drop_index_if_exists("idx_leads_telegram_id")
+        await self._drop_index_if_exists("idx_leads_telegram_id_partial")
         await self._db.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_telegram_id
-            ON leads(telegram_id) WHERE telegram_id IS NOT NULL;
+            ON leads(telegram_id);
             """
         )
+
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                telegram_id TEXT NOT NULL UNIQUE,
+                username TEXT,
+                first_name TEXT,
+                last_name TEXT,
+                language_code TEXT,
+                is_premium INTEGER,
+                is_bot INTEGER,
+                raw_data TEXT
+            );
+            """
+        )
+        for column, ddl in [
+            ("raw_data", "ALTER TABLE users ADD COLUMN raw_data TEXT"),
+            ("language_code", "ALTER TABLE users ADD COLUMN language_code TEXT"),
+            ("is_premium", "ALTER TABLE users ADD COLUMN is_premium INTEGER"),
+            ("is_bot", "ALTER TABLE users ADD COLUMN is_bot INTEGER"),
+        ]:
+            if not await self._has_column(column, table="users"):
+                await self._db.execute(ddl)
+
         await self._db.commit()
 
-    async def _has_column(self, name: str) -> bool:
-        cursor = await self._db.execute("PRAGMA table_info(leads)")
+    async def _has_column(self, name: str, table: str = "leads") -> bool:
+        cursor = await self._db.execute(f"PRAGMA table_info({table})")
         rows = await cursor.fetchall()
         await cursor.close()
         return any(row[1] == name for row in rows)
+
+    async def _drop_index_if_exists(self, name: str) -> None:
+        cursor = await self._db.execute("PRAGMA index_list(leads)")
+        indexes = [row[1] for row in await cursor.fetchall()]
+        await cursor.close()
+        if name in indexes:
+            await self._db.execute(f"DROP INDEX {name}")
 
     async def _save_lead(self, payload: Dict[str, Any]) -> None:
         if not self._db:
             raise RuntimeError("NotificationService DB is not initialized")
 
-        protocols = payload.get("protocols") or []
-        protocols_json = json.dumps(protocols, ensure_ascii=False)
+        protocols = payload.get("protocols")
+        protocols_json = json.dumps(protocols, ensure_ascii=False) if protocols is not None else None
         status = payload.get("status")
+        existing = None
+        if payload.get("telegram_id"):
+            existing = await self.get_lead_by_telegram(str(payload.get("telegram_id")))
         if not status:
-            existing = None
-            if payload.get("telegram_id"):
-                existing = await self.get_lead_by_telegram(str(payload.get("telegram_id")))
             status = (existing or {}).get("status") or "Принята"
+
+        def _bool(val: Any) -> Optional[int]:
+            if val is None:
+                return None
+            return 1 if bool(val) else 0
 
         await self._db.execute(
             """
-            INSERT OR REPLACE INTO leads
+            INSERT INTO leads
             (telegram_id, created_at, scenario, name, use_case, custom_task, extra, username,
+             first_name, last_name, language_code, is_premium, is_bot, user_json,
              vps_ip, ssh_ok, root_password, domain, protocols, bot_token,
              payment_id, payment_url, payment_status, status)
             VALUES (?, COALESCE((SELECT created_at FROM leads WHERE telegram_id=?), CURRENT_TIMESTAMP),
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                scenario=COALESCE(excluded.scenario, leads.scenario),
+                name=COALESCE(excluded.name, leads.name),
+                use_case=COALESCE(excluded.use_case, leads.use_case),
+                custom_task=COALESCE(excluded.custom_task, leads.custom_task),
+                extra=COALESCE(excluded.extra, leads.extra),
+                username=COALESCE(excluded.username, leads.username),
+                first_name=COALESCE(excluded.first_name, leads.first_name),
+                last_name=COALESCE(excluded.last_name, leads.last_name),
+                language_code=COALESCE(excluded.language_code, leads.language_code),
+                is_premium=COALESCE(excluded.is_premium, leads.is_premium),
+                is_bot=COALESCE(excluded.is_bot, leads.is_bot),
+                user_json=COALESCE(excluded.user_json, leads.user_json),
+                vps_ip=COALESCE(excluded.vps_ip, leads.vps_ip),
+                ssh_ok=COALESCE(excluded.ssh_ok, leads.ssh_ok),
+                root_password=COALESCE(excluded.root_password, leads.root_password),
+                domain=COALESCE(excluded.domain, leads.domain),
+                protocols=COALESCE(excluded.protocols, leads.protocols),
+                bot_token=COALESCE(excluded.bot_token, leads.bot_token),
+                payment_id=COALESCE(excluded.payment_id, leads.payment_id),
+                payment_url=COALESCE(excluded.payment_url, leads.payment_url),
+                payment_status=COALESCE(excluded.payment_status, leads.payment_status),
+                status=COALESCE(excluded.status, leads.status);
             """,
             (
                 str(payload.get("telegram_id")) if payload.get("telegram_id") else None,
@@ -344,8 +562,14 @@ class NotificationService:
                 payload.get("custom_task"),
                 payload.get("extra"),
                 payload.get("username"),
+                payload.get("first_name"),
+                payload.get("last_name"),
+                payload.get("language_code"),
+                _bool(payload.get("is_premium")),
+                _bool(payload.get("is_bot")),
+                payload.get("user_json"),
                 payload.get("vps_ip"),
-                1 if payload.get("ssh_ok") else 0 if payload.get("ssh_ok") is not None else None,
+                _bool(payload.get("ssh_ok")),
                 payload.get("root_password"),
                 payload.get("domain"),
                 protocols_json,
@@ -357,14 +581,60 @@ class NotificationService:
             ),
         )
         await self._db.commit()
+        if payload.get("telegram_id"):
+            self._lead_cache.add(str(payload["telegram_id"]))
 
-    async def get_lead_by_telegram(self, telegram_id: str) -> Optional[dict[str, Any]]:
+    async def _save_user_from_payload(self, payload: Dict[str, Any]) -> None:
         if not self._db:
             raise RuntimeError("NotificationService DB is not initialized")
-        cursor = await self._db.execute("SELECT * FROM leads WHERE telegram_id=? LIMIT 1", (telegram_id,))
-        row = await cursor.fetchone()
+        telegram_id = payload.get("telegram_id")
+        if not telegram_id:
+            return
+        raw_json = payload.get("user_json")
+        if not raw_json and payload.get("raw_user"):
+            try:
+                raw_json = json.dumps(payload["raw_user"], ensure_ascii=False)
+            except Exception:
+                raw_json = None
+
+        def _bool(val: Any) -> Optional[int]:
+            if val is None:
+                return None
+            return 1 if bool(val) else 0
+
+        await self._db.execute(
+            """
+            INSERT INTO users (telegram_id, username, first_name, last_name, language_code, is_premium, is_bot, raw_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                username=COALESCE(excluded.username, users.username),
+                first_name=COALESCE(excluded.first_name, users.first_name),
+                last_name=COALESCE(excluded.last_name, users.last_name),
+                language_code=COALESCE(excluded.language_code, users.language_code),
+                is_premium=COALESCE(excluded.is_premium, users.is_premium),
+                is_bot=COALESCE(excluded.is_bot, users.is_bot),
+                raw_data=COALESCE(excluded.raw_data, users.raw_data);
+            """,
+            (
+                str(telegram_id),
+                payload.get("username"),
+                payload.get("first_name"),
+                payload.get("last_name"),
+                payload.get("language_code"),
+                _bool(payload.get("is_premium")),
+                _bool(payload.get("is_bot")),
+                raw_json,
+            ),
+        )
+        await self._db.commit()
+
+    async def _warm_cache(self) -> None:
+        if not self._db:
+            return
+        cursor = await self._db.execute("SELECT telegram_id FROM leads WHERE telegram_id IS NOT NULL")
+        rows = await cursor.fetchall()
         await cursor.close()
-        return dict(row) if row else None
+        self._lead_cache = {str(r["telegram_id"]) for r in rows if r["telegram_id"]}
 
 
 __all__ = ["NotificationService"]
