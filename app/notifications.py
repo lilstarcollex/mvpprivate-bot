@@ -17,13 +17,16 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 class NotificationService:
     """Separate bot for sending structured lead notifications and storing history."""
 
-    def __init__(self, token: str, chat_id: int, db_path: Path) -> None:
+    def __init__(self, token: str, chat_id: int, db_path: Path, main_bot_token: Optional[str] = None) -> None:
         self.token = token
         self.chat_id = chat_id
         self.db_path = Path(db_path)
+        self.main_bot_token = main_bot_token
         self._bot: Optional[Bot] = None
         self._session: Optional[AiohttpSession] = None
         self._db: Optional[aiosqlite.Connection] = None
+        self._main_bot: Optional[Bot] = None
+        self._main_session: Optional[AiohttpSession] = None
 
     async def start(self) -> None:
         if self._bot:
@@ -38,6 +41,13 @@ class NotificationService:
             session=self._session,
             default=DefaultBotProperties(parse_mode="HTML"),
         )
+        if self.main_bot_token:
+            self._main_session = AiohttpSession()
+            self._main_bot = Bot(
+                token=self.main_bot_token,
+                session=self._main_session,
+                default=DefaultBotProperties(parse_mode="HTML"),
+            )
 
     async def close(self) -> None:
         if self._bot:
@@ -49,6 +59,12 @@ class NotificationService:
         if self._db:
             await self._db.close()
             self._db = None
+        if self._main_bot:
+            await self._main_bot.session.close()
+            self._main_bot = None
+        if self._main_session:
+            await self._main_session.close()
+            self._main_session = None
 
     async def send_lead(self, payload: Dict[str, Any]) -> None:
         if not self._bot:
@@ -75,12 +91,28 @@ class NotificationService:
             """
             SELECT id, created_at, scenario, name, use_case, custom_task, extra,
                    telegram_id, username, vps_ip, ssh_ok, domain, protocols, bot_token,
-                   payment_id, payment_url, payment_status
+                   payment_id, payment_url, payment_status, status
             FROM leads
             ORDER BY id DESC
             LIMIT ? OFFSET ?
             """,
             (limit, offset),
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [dict(row) for row in rows]
+
+    async def fetch_all_leads(self) -> list[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        cursor = await self._db.execute(
+            """
+            SELECT id, created_at, scenario, name, use_case, custom_task, extra,
+                   telegram_id, username, vps_ip, ssh_ok, domain, protocols, bot_token,
+                   payment_id, payment_url, payment_status, status
+            FROM leads
+            ORDER BY id DESC
+            """
         )
         rows = await cursor.fetchall()
         await cursor.close()
@@ -104,6 +136,63 @@ class NotificationService:
         row = await cursor.fetchone()
         await cursor.close()
         return bool(row)
+
+    async def get_lead(self, lead_id: int) -> Optional[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        cursor = await self._db.execute("SELECT * FROM leads WHERE id=?", (lead_id,))
+        row = await cursor.fetchone()
+        await cursor.close()
+        return dict(row) if row else None
+
+    async def delete_lead(self, lead_id: int) -> Optional[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        lead = await self.get_lead(lead_id)
+        if not lead:
+            return None
+        await self._db.execute("DELETE FROM leads WHERE id=?", (lead_id,))
+        await self._db.commit()
+        return lead
+
+    async def search_leads(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        query = query.strip().lstrip("@")
+        params = []
+        sql = """
+        SELECT * FROM leads
+        WHERE 1=1
+        """
+        if query.isdigit():
+            sql += " AND (telegram_id = ? OR id = ?)"
+            params.extend([query, int(query)])
+        else:
+            sql += " AND (LOWER(username) LIKE ?)"
+            params.append(f"%{query.lower()}%")
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self._db.execute(sql, params)
+        rows = await cursor.fetchall()
+        await cursor.close()
+        return [dict(r) for r in rows]
+
+    async def update_status(self, lead_id: int, status: str) -> Optional[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        await self._db.execute("UPDATE leads SET status=? WHERE id=?", (status, lead_id))
+        await self._db.commit()
+        return await self.get_lead(lead_id)
+
+    async def send_user_notification(self, telegram_id: int, text: str) -> bool:
+        if not self._main_bot:
+            return False
+        try:
+            await self._main_bot.send_message(chat_id=int(telegram_id), text=text)
+            return True
+        except Exception as exc:  # pragma: no cover
+            logging.error("Failed to notify user %s: %s", telegram_id, exc)
+            return False
 
     @property
     def bot(self) -> Bot:
@@ -153,6 +242,7 @@ class NotificationService:
             f"Bot Token: {bot_token_masked}",
             f"Оплата: {payment_status}",
             f"Payment URL: {payment_url}",
+            f"Статус: {html.escape(payload.get('status') or '—')}",
         ]
         return "\n".join(lines)
 
@@ -178,7 +268,8 @@ class NotificationService:
                 bot_token TEXT,
                 payment_id TEXT,
                 payment_url TEXT,
-                payment_status TEXT
+                payment_status TEXT,
+                status TEXT
             );
             """
         )
@@ -194,6 +285,7 @@ class NotificationService:
             ("payment_id", "ALTER TABLE leads ADD COLUMN payment_id TEXT"),
             ("payment_url", "ALTER TABLE leads ADD COLUMN payment_url TEXT"),
             ("payment_status", "ALTER TABLE leads ADD COLUMN payment_status TEXT"),
+            ("status", "ALTER TABLE leads ADD COLUMN status TEXT"),
         ]:
             if not await self._has_column(column):
                 await self._db.execute(ddl)
@@ -227,15 +319,21 @@ class NotificationService:
 
         protocols = payload.get("protocols") or []
         protocols_json = json.dumps(protocols, ensure_ascii=False)
+        status = payload.get("status")
+        if not status:
+            existing = None
+            if payload.get("telegram_id"):
+                existing = await self.get_lead_by_telegram(str(payload.get("telegram_id")))
+            status = (existing or {}).get("status") or "Принята"
 
         await self._db.execute(
             """
             INSERT OR REPLACE INTO leads
             (telegram_id, created_at, scenario, name, use_case, custom_task, extra, username,
              vps_ip, ssh_ok, root_password, domain, protocols, bot_token,
-             payment_id, payment_url, payment_status)
+             payment_id, payment_url, payment_status, status)
             VALUES (?, COALESCE((SELECT created_at FROM leads WHERE telegram_id=?), CURRENT_TIMESTAMP),
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(payload.get("telegram_id")) if payload.get("telegram_id") else None,
@@ -255,9 +353,18 @@ class NotificationService:
                 payload.get("payment_id"),
                 payload.get("payment_url"),
                 payload.get("payment_status"),
+                status,
             ),
         )
         await self._db.commit()
+
+    async def get_lead_by_telegram(self, telegram_id: str) -> Optional[dict[str, Any]]:
+        if not self._db:
+            raise RuntimeError("NotificationService DB is not initialized")
+        cursor = await self._db.execute("SELECT * FROM leads WHERE telegram_id=? LIMIT 1", (telegram_id,))
+        row = await cursor.fetchone()
+        await cursor.close()
+        return dict(row) if row else None
 
 
 __all__ = ["NotificationService"]

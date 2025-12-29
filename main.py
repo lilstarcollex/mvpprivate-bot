@@ -5,6 +5,7 @@ import logging
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.bot import DefaultBotProperties
+from aiogram.fsm.storage.memory import MemoryStorage
 
 from app.config import load_config
 from app.handlers.main import register_handlers
@@ -24,6 +25,7 @@ async def main() -> None:
         token=config.notification_bot_token,
         chat_id=config.notification_chat_id,
         db_path=config.leads_db_path,
+        main_bot_token=config.main_bot_token,
     )
     await notification_service.start()
 
@@ -40,7 +42,7 @@ async def main() -> None:
     dp = Dispatcher(storage=storage)
     register_handlers(dp, notification_service, payment_client)
 
-    notify_dp = Dispatcher()
+    notify_dp = Dispatcher(storage=MemoryStorage())
     register_notification_handlers(notify_dp, notification_service)
 
     async def run_main_bot() -> None:

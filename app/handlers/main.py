@@ -246,6 +246,7 @@ async def _finish_specialist_flow(message: Message, state: FSMContext, notificat
         "extra": data.get("extra"),
         "telegram_id": data.get("telegram_id"),
         "username": data.get("username"),
+        "status": "Принята",
         "payment_status": "pending",
     }
 
@@ -307,6 +308,7 @@ async def _finish_vps_flow(message: Message, state: FSMContext, notification_ser
         "payment_id": data.get("payment_id"),
         "payment_url": data.get("payment_url"),
         "payment_status": data.get("payment_status"),
+        "status": "Принята",
     }
 
     await message.answer(
