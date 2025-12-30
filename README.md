@@ -21,7 +21,7 @@
 2) Скопировать `.env.example` → `.env` и заполнить:
    - `MAIN_BOT_TOKEN` — токен основного бота.
    - `NOTIFICATION_BOT_TOKEN` — токен бота-уведомителя.
-   - `NOTIFICATION_CHAT_ID` — chat_id, куда слать уведомления (личка/группа/канал, при необходимости с `-100`).
+   - `NOTIFICATION_CHAT_ID` — chat_id(ы), куда слать уведомления (личка/группа/канал, при необходимости с `-100`); можно несколько через запятую или пробел.
    - `STORAGE_PATH` — путь к SQLite (по умолчанию `data/state.sqlite3`).
    - `LEADS_DB_PATH` — путь к базе истории заявок (по умолчанию `data/leads.sqlite3`).
    - `YOOKASSA_SHOP_ID` / `YOOKASSA_SECRET_KEY` — при наличии включат реальную оплату (сейчас работает stub).

@@ -269,7 +269,7 @@ def register_notification_handlers(dp: Dispatcher, notification_service: Notific
 
 
 def _is_admin_chat(message: Optional[Message], notification_service: NotificationService) -> bool:
-    return bool(message and message.chat and message.chat.id == notification_service.chat_id)
+    return bool(message and message.chat and message.chat.id in notification_service.chat_ids)
 
 
 async def _send_page(message: Message, notification_service: NotificationService, page: int, edit: bool) -> None:

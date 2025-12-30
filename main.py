@@ -23,7 +23,7 @@ async def main() -> None:
     await storage.start()
     notification_service = NotificationService(
         token=config.notification_bot_token,
-        chat_id=config.notification_chat_id,
+        chat_ids=config.notification_chat_ids,
         db_path=config.leads_db_path,
         main_bot_token=config.main_bot_token,
     )

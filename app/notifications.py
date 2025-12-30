@@ -17,9 +17,9 @@ from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 class NotificationService:
     """Separate bot for sending structured lead notifications and storing history."""
 
-    def __init__(self, token: str, chat_id: int, db_path: Path, main_bot_token: Optional[str] = None) -> None:
+    def __init__(self, token: str, chat_ids: list[int], db_path: Path, main_bot_token: Optional[str] = None) -> None:
         self.token = token
-        self.chat_id = chat_id
+        self.chat_ids = list(dict.fromkeys(chat_ids))
         self.db_path = Path(db_path)
         self.main_bot_token = main_bot_token
         self._bot: Optional[Bot] = None
@@ -75,16 +75,22 @@ class NotificationService:
         await self._save_user_from_payload(payload)
         text = self._format_payload(payload)
         await self._save_lead(payload)
+        for chat_id in self.chat_ids:
+            await self._send_message(chat_id, text)
+
+    async def _send_message(self, chat_id: int, text: str) -> None:
+        if not self._bot:
+            raise RuntimeError("NotificationService is not started")
         try:
-            await self._bot.send_message(chat_id=self.chat_id, text=text, disable_web_page_preview=True)
+            await self._bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
         except TelegramRetryAfter as exc:
-            logging.warning("Notification rate limited, retrying after %ss", exc.retry_after)
+            logging.warning("Notification rate limited for chat %s, retrying after %ss", chat_id, exc.retry_after)
             await asyncio.sleep(exc.retry_after)
-            await self._bot.send_message(chat_id=self.chat_id, text=text, disable_web_page_preview=True)
+            await self._bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
         except TelegramAPIError as exc:
-            logging.error("Failed to send notification: %s", exc)
+            logging.error("Failed to send notification to chat %s: %s", chat_id, exc)
         except Exception as exc:  # pragma: no cover
-            logging.exception("Unexpected error while sending notification: %s", exc)
+            logging.exception("Unexpected error while sending notification to chat %s: %s", chat_id, exc)
 
     async def fetch_leads(self, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         if not self._db:
